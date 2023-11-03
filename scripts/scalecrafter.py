@@ -1,8 +1,12 @@
 import functools
 import math
+import sys
+import textwrap
+from typing import List, Tuple
 import torch.nn
-from modules import shared, scripts, processing, script_callbacks
-from lib_scalecrafter import global_state
+import gradio as gr
+from modules import scripts, processing, script_callbacks, prompt_parser, sd_samplers
+from lib_scalecrafter import global_state, hijacker
 
 
 class Script(scripts.Script):
@@ -12,22 +16,158 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
-    def process(self, p: processing.StableDiffusionProcessing, *args):
-        global_state.enable = True
+    def ui(self, is_img2img):
+        with gr.Accordion(label=self.title(), open=False):
+            enable = gr.Checkbox(
+                label="Enabled",
+                value=False,
+                elem_id=self.elem_id("enable"),
+            )
+
+            stop_step_ratio = gr.Slider(
+                label="Stop At Step",
+                value=0.5,
+                minimum=0,
+                maximum=1,
+                elem_id=self.elem_id("stop_at_step"),
+            )
+
+            inner_blocks = gr.Slider(
+                label="Inner Blocks",
+                value=5,
+                minimum=0,
+                maximum=12,
+                step=1,
+                elem_id=self.elem_id("inner_blocks"),
+            )
+
+        return enable, stop_step_ratio, inner_blocks
+
+    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, *args, **kwargs):
+        global_state.enable = enable
+
         train_size = 1024 if p.sd_model.is_sdxl else 512
         global_state.dilation = math.sqrt(p.width * p.height) / train_size
-        global_state.outer_blocks = 4
-        global_state.stop_at_step = 10
+        global_state.dilation_x = p.width / train_size
+        global_state.dilation_y = p.height / train_size
+        global_state.inner_blocks = inner_blocks
+        global_state.stop_step_ratio = stop_step_ratio
 
-    def postprocess_batch(self, p, *args, **kwargs):
-        global_state.current_sampling_step = 0
+    def before_process_batch(self, p, *args, **kwargs):
+        global_state.current_step = 0
+        global_state.total_steps = p.steps
+        global_state.batch_size = p.batch_size
+
+    def before_hr(self, p: processing.StableDiffusionProcessingTxt2Img, *args):
+        global_state.total_steps = p.steps
+
+        train_size = 1024 if p.sd_model.is_sdxl else 512
+        global_state.dilation = math.sqrt(p.width * p.height) / train_size
+        global_state.dilation_x = p.width / train_size
+        global_state.dilation_y = p.height / train_size
 
 
-def increment_sampling_step(*args, **kwargs):
-    global_state.current_sampling_step += 1
+prompt_parser_hijacker = hijacker.ModuleHijacker.install_or_get(
+    module=prompt_parser,
+    hijacker_attribute="__scalecrafter_hijacker",
+    on_uninstall=script_callbacks.on_script_unloaded,
+)
 
 
-script_callbacks.on_cfg_denoised(increment_sampling_step)
+@prompt_parser_hijacker.hijack("get_multicond_learned_conditioning")
+def get_multicond_learned_conditioning_hijack(model, prompts, steps, *args, original_function, **kwargs):
+    conds = original_function(model, prompts, steps, *args, **kwargs)
+    if not global_state.enable:
+        return conds
+
+    empty_schedule = prompt_parser.get_learned_conditioning(model, [""], steps, *args, **kwargs)[0]
+    conds.batch[0][:0] = [prompt_parser.ComposableScheduledPromptConditioning(schedules=empty_schedule)] * len(conds.batch)
+    return conds
+
+
+def on_cfg_denoiser(params: script_callbacks.CFGDenoiserParams, *args, **kwargs):
+    if global_state.enable:
+        batch_size = params.text_uncond.shape[0]
+        params.text_cond[:batch_size] = params.text_uncond
+
+
+script_callbacks.on_cfg_denoiser(on_cfg_denoiser)
+
+
+def on_cfg_denoised(params: script_callbacks.CFGDenoisedParams, *args, **kwargs):
+    global_state.current_step += 1
+
+
+script_callbacks.on_cfg_denoised(on_cfg_denoised)
+
+
+def combine_denoised_hijack(
+    x_out: torch.Tensor,
+    batch_cond_indices: List[List[Tuple[int, float]]],
+    text_uncond: torch.Tensor,
+    cond_scale: float,
+    original_function,
+) -> torch.Tensor:
+    if not global_state.enable:
+        return original_function(x_out, batch_cond_indices, text_uncond, cond_scale)
+
+    batch_size = text_uncond.shape[0]
+    damped_uncond = x_out[:batch_size]
+    denoised = x_out[-batch_size:].clone()
+
+    for i, cond_indices in enumerate(batch_cond_indices):
+        if i == 0:
+            cond_indices = cond_indices[batch_size:]
+
+        for cond_index, weight in cond_indices:
+            denoised[i] += (x_out[cond_index] - damped_uncond[i]) * (weight * cond_scale)
+
+    return denoised
+
+
+sd_samplers_hijacker = hijacker.ModuleHijacker.install_or_get(
+    module=sd_samplers,
+    hijacker_attribute='__neutral_prompt_hijacker',
+    on_uninstall=script_callbacks.on_script_unloaded,
+)
+
+
+@sd_samplers_hijacker.hijack('create_sampler')
+def create_sampler_hijack(name: str, model, original_function):
+    sampler = original_function(name, model)
+    if not hasattr(sampler, 'model_wrap_cfg') or not hasattr(sampler.model_wrap_cfg, 'combine_denoised'):
+        if global_state.enable:
+            warn_unsupported_sampler()
+
+        return sampler
+
+    sampler.model_wrap_cfg.combine_denoised = functools.partial(
+        combine_denoised_hijack,
+        original_function=sampler.model_wrap_cfg.combine_denoised
+    )
+    return sampler
+
+
+def warn_unsupported_sampler():
+    console_warn('''
+        Neutral prompt relies on composition via AND, which the webui does not support when using any of the DDIM, PLMS and UniPC samplers
+        The sampler will NOT be patched
+        Falling back on original sampler implementation...
+    ''')
+
+
+def warn_projection_not_found():
+    console_warn('''
+        Could not find a projection for one or more AND_PERP prompts
+        These prompts will NOT be made perpendicular
+    ''')
+
+
+def console_warn(message):
+    if not global_state.verbose:
+        return
+
+    print(f'\n[sd-webui-neutral-prompt extension]{textwrap.dedent(message)}', file=sys.stderr)
 
 
 def make_dilate_model(model):
@@ -61,28 +201,30 @@ def patch_conv2d(module, block_type, block_index):
 def conv2d_forward_patch(x, *args, block_type, block_index, self, original_function, **kwargs):
     if not (
         global_state.enable and
-        global_state.current_sampling_step < global_state.stop_at_step and (
-            block_type in {"down", "up"} and block_index < global_state.outer_blocks or
+        global_state.current_step / global_state.total_steps < global_state.stop_step_ratio and (
+            block_type in {"down", "up"} and block_index < global_state.inner_blocks or
             block_type == "middle"
         )
     ):
         return original_function(x, *args, **kwargs)
 
+    x_uncond = original_function(x[-global_state.batch_size:], *args, **kwargs)
+    x = x[:-global_state.batch_size]
+
     dilation_ceil = math.ceil(global_state.dilation)
 
-    scale_factor = dilation_ceil / global_state.dilation
-    original_size = x.shape[-2:]
-    x = torch.nn.functional.interpolate(x, scale_factor=scale_factor, mode="bilinear")
+    x_scale_factor = dilation_ceil / global_state.dilation
+    x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
 
     original_dilation = self.dilation
     original_padding = self.padding
     try:
         self.dilation = (dilation_ceil, dilation_ceil)
         self.padding = (dilation_ceil, dilation_ceil)
-        x_out = original_function(x, *args, **kwargs)
+        x = original_function(x, *args, **kwargs)
     finally:
         self.dilation = original_dilation
         self.padding = original_padding
 
-    x_out = torch.nn.functional.interpolate(x_out, size=original_size, mode="bilinear")
-    return x_out
+    x = torch.nn.functional.interpolate(x, size=x_uncond.shape[-2:], mode="bilinear")
+    return torch.cat([x, x_uncond])
