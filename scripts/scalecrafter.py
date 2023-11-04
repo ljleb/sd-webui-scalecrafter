@@ -41,28 +41,41 @@ class Script(scripts.Script):
                 elem_id=self.elem_id("inner_blocks"),
             )
 
-            with gr.Row():
-                damped_inner_blocks = gr.Slider(
-                    label="Noise-Damped CFG Inner Blocks",
-                    value=7,
-                    minimum=0,
-                    maximum=12,
-                    step=1,
-                    elem_id=self.elem_id("noise_damped_inner_blocks"),
-                )
+            with gr.Accordion(label="Noise-Damped CFG Scale"):
+                with gr.Row():
+                    damped_blocks_start = gr.Slider(
+                        label="First Block (Included)",
+                        value=7,
+                        minimum=0,
+                        maximum=12,
+                        step=1,
+                        elem_id=self.elem_id("noise_damped_block_start"),
+                    )
 
-                damped_outer_blocks = gr.Slider(
-                    label="Noise-Damped CFG Outer Blocks",
-                    value=12,
-                    minimum=0,
-                    maximum=12,
-                    step=1,
-                    elem_id=self.elem_id("noise_damped_outer_blocks"),
-                )
+                    damped_blocks_stop = gr.Slider(
+                        label="Last Block (Excluded)",
+                        value=12,
+                        minimum=7,
+                        maximum=12,
+                        step=1,
+                        elem_id=self.elem_id("noise_damped_block_stop"),
+                    )
 
-        return enable, stop_step_ratio, inner_blocks, damped_inner_blocks, damped_outer_blocks
+        damped_blocks_start.release(
+            fn=lambda damped_blocks_start, damped_blocks_stop: gr.Slider.update(minimum=damped_blocks_start, value=max(damped_blocks_start, damped_blocks_stop)),
+            inputs=[damped_blocks_start, damped_blocks_stop],
+            outputs=[damped_blocks_stop],
+        )
 
-    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, damped_inner_blocks, damped_outer_blocks, *args, **kwargs):
+        damped_blocks_stop.release(
+            fn=lambda damped_blocks_stop, damped_blocks_start: gr.Slider.update(maximum=damped_blocks_stop, value=min(damped_blocks_stop, damped_blocks_start)),
+            inputs=[damped_blocks_stop, damped_blocks_start],
+            outputs=[damped_blocks_start],
+        )
+
+        return enable, stop_step_ratio, inner_blocks, damped_blocks_start, damped_blocks_stop
+
+    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, damped_blocks_start, damped_blocks_stop, *args, **kwargs):
         global_state.enable = enable
 
         train_size = 1024 if p.sd_model.is_sdxl else 512
@@ -70,8 +83,8 @@ class Script(scripts.Script):
         global_state.dilation_x = p.width / train_size
         global_state.dilation_y = p.height / train_size
         global_state.inner_blocks = inner_blocks
-        global_state.damped_inner_blocks = damped_inner_blocks
-        global_state.damped_outer_blocks = damped_outer_blocks
+        global_state.damped_blocks_start = damped_blocks_start
+        global_state.damped_blocks_stop = damped_blocks_stop
         global_state.stop_step_ratio = stop_step_ratio
 
     def before_process_batch(self, p, *args, **kwargs):
@@ -245,7 +258,7 @@ def conv2d_forward_patch(x, *args, block_type, block_index, self, original_funct
         x = original_function(x, *args, **kwargs)
 
     if (
-        block_type in {"down", "up"} and global_state.damped_outer_blocks <= block_index < global_state.damped_inner_blocks
+        block_type in {"down", "up"} and global_state.damped_blocks_start <= block_index < global_state.damped_blocks_stop
     ):
         x_damped_uncond = dilate_conv2d_undilate(self, x_damped_uncond, global_state.dilation, out_shape, original_function, *args, **kwargs)
     else:
