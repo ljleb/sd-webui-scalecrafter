@@ -52,7 +52,7 @@ class Script(scripts.Script):
                         label="First Block (Included)",
                         value=0,
                         minimum=0,
-                        maximum=12,
+                        maximum=5,
                         step=1,
                         elem_id=self.elem_id("noise_damped_block_start"),
                     )
@@ -60,7 +60,7 @@ class Script(scripts.Script):
                     damped_blocks_stop = gr.Slider(
                         label="Last Block (Excluded)",
                         value=5,
-                        minimum=7,
+                        minimum=0,
                         maximum=12,
                         step=1,
                         elem_id=self.elem_id("noise_damped_block_stop"),
