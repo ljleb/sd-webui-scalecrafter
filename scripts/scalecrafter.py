@@ -45,7 +45,7 @@ class Script(scripts.Script):
                 enable_damped_cfg = gr.Checkbox(
                     label="Enable Noise-Damped CFG Scale",
                     value=True,
-
+                    elem_id=self.elem_id("noise_damped_enable")
                 )
                 with gr.Row():
                     damped_blocks_start = gr.Slider(
@@ -78,9 +78,9 @@ class Script(scripts.Script):
             outputs=[damped_blocks_start],
         )
 
-        return enable, stop_step_ratio, inner_blocks, damped_blocks_start, damped_blocks_stop
+        return enable, stop_step_ratio, inner_blocks, enable_damped_cfg, damped_blocks_start, damped_blocks_stop
 
-    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, damped_blocks_start, damped_blocks_stop, *args, **kwargs):
+    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, enable_damped_cfg, damped_blocks_start, damped_blocks_stop, *args, **kwargs):
         global_state.enable = enable
 
         train_size = 1024 if p.sd_model.is_sdxl else 512
@@ -88,6 +88,7 @@ class Script(scripts.Script):
         global_state.dilation_x = p.width / train_size
         global_state.dilation_y = p.height / train_size
         global_state.inner_blocks = inner_blocks
+        global_state.enable_damped_cfg = enable_damped_cfg
         global_state.damped_blocks_start = damped_blocks_start
         global_state.damped_blocks_stop = damped_blocks_stop
         global_state.stop_step_ratio = stop_step_ratio
@@ -263,6 +264,7 @@ def conv2d_forward_patch(x, *args, block_type, block_index, self, original_funct
         x = original_function(x, *args, **kwargs)
 
     if (
+        global_state.enable_damped_cfg and
         block_type in {"down", "up"} and global_state.damped_blocks_start <= block_index < global_state.damped_blocks_stop
     ):
         x_damped_uncond = dilate_conv2d_undilate(self, x_damped_uncond, global_state.dilation, out_shape, original_function, *args, **kwargs)
