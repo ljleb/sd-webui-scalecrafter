@@ -1,12 +1,18 @@
 import functools
+import gradio as gr
 import math
+import scipy
 import sys
 import textwrap
-from typing import List, Tuple
 import torch.nn
-import gradio as gr
-from modules import scripts, processing, script_callbacks, prompt_parser, sd_samplers
 from lib_scalecrafter import global_state, hijacker
+from modules import processing, prompt_parser, scripts, script_callbacks, sd_samplers
+from pathlib import Path
+from typing import List, Tuple
+
+
+dispersion_transform = scipy.io.loadmat(str(Path(__file__).parent.parent / "dispersion_transforms" / "R20to1.mat"))["R"]
+global_state.dispersion_transform = torch.tensor(dispersion_transform, device="cuda")
 
 
 class Script(scripts.Script):
@@ -85,8 +91,6 @@ class Script(scripts.Script):
 
         train_size = 1024 if p.sd_model.is_sdxl else 512
         global_state.dilation = math.sqrt(p.width * p.height) / train_size
-        global_state.dilation_x = p.width / train_size
-        global_state.dilation_y = p.height / train_size
         global_state.inner_blocks = inner_blocks
         global_state.enable_damped_cfg = enable_damped_cfg
         global_state.damped_blocks_start = damped_blocks_start
@@ -226,67 +230,104 @@ def make_dilate_model(model):
 script_callbacks.on_model_loaded(make_dilate_model)
 
 
-def patch_conv2d(module, block_type, block_index):
-    for name, submodule in module.named_modules():
+def patch_conv2d(unet, block_type, block_index):
+    updates = {}
+    for name, submodule in list(unet.named_modules()):
         if isinstance(submodule, torch.nn.Conv2d) and (submodule.kernel_size == 3 or submodule.kernel_size == (3, 3)):
-            if getattr(submodule, "__scalecrafter_hijacked", False):
-                continue
-            else:
-                setattr(submodule, "__scalecrafter_hijacked", True)
+            updates[name] = ScheduledRedilatedConv2D(submodule, block_type, block_index)
 
-            submodule.forward = functools.partial(
-                conv2d_forward_patch,
-                block_type=block_type,
-                block_index=block_index,
-                self=submodule,
-                original_function=submodule.forward,
-            )
+    for name, conv in updates.items():
+        current_module = unet
+        keys = name.split(".")
+        for key in keys[:-1]:
+            try:
+                current_module = current_module[int(key)]
+            except ValueError:
+                current_module = getattr(current_module, key)
+        try:
+            current_module[int(keys[-1])] = conv
+        except ValueError:
+            setattr(current_module, keys[-1], conv)
+
+class ScheduledRedilatedConv2D(torch.nn.Conv2d):
+    def __init__(self, conv2d, block_type, block_index):
+        super().__init__(
+            in_channels=conv2d.in_channels,
+            out_channels=conv2d.out_channels,
+            kernel_size=conv2d.kernel_size,
+            stride=conv2d.stride,
+            padding=conv2d.padding,
+            dilation=conv2d.dilation,
+            groups=conv2d.groups,
+            padding_mode=conv2d.padding_mode,
+            device=conv2d.weight.device,
+            dtype=conv2d.weight.dtype,
+        )
+        self.weight.data.copy_(conv2d.weight.data)
+        self.bias.data.copy_(conv2d.bias.data)
+        self.dispersed_conv2d = DispersedConv2D(conv2d)
+        self.block_type = block_type
+        self.block_index = block_index
+
+    def forward(self, x, *args, **kwargs):
+        if not (
+            global_state.enable and
+            global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
+        ):
+            return super().forward(x, *args, **kwargs)
+
+        x_uncond = super().forward(x[-global_state.batch_size:], *args, **kwargs)
+        out_shape = x_uncond.shape[-2:]
+        x_damped_uncond = x[:global_state.batch_size]
+        x = x[global_state.batch_size:-global_state.batch_size]
+
+        if (
+            self.block_type in {"down", "up"} and self.block_index < global_state.inner_blocks or
+            self.block_type == "middle"
+        ):
+            x = self.redilate_forward(x, out_shape, *args, **kwargs)
+        else:
+            x = super().forward(x, *args, **kwargs)
+
+        if (
+            global_state.enable_damped_cfg and
+            self.block_type in {"down", "up"} and global_state.damped_blocks_start <= self.block_index < global_state.damped_blocks_stop
+        ):
+            x_damped_uncond = self.redilate_forward(x_damped_uncond, out_shape, *args, **kwargs)
+        else:
+            x_damped_uncond = super().forward(x_damped_uncond, *args, **kwargs)
+
+        return torch.cat([x_damped_uncond, x, x_uncond])
+
+    def redilate_forward(self, x, out_shape, *args, **kwargs):
+        dilation_ceil = math.ceil(global_state.dilation)
+        x_scale_factor = dilation_ceil / global_state.dilation
+        x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
+        x = self.dispersed_conv2d(x, dilation_ceil, *args, **kwargs)
+        return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
 
 
-def conv2d_forward_patch(x, *args, block_type, block_index, self, original_function, **kwargs):
-    if not (
-        global_state.enable and
-        global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
-    ):
-        return original_function(x, *args, **kwargs)
+class DispersedConv2D(torch.nn.Module):
+    def __init__(self, conv2d):
+        super().__init__()
 
-    x_uncond = original_function(x[-global_state.batch_size:], *args, **kwargs)
-    out_shape = x_uncond.shape[-2:]
-    x_damped_uncond = x[:global_state.batch_size]
-    x = x[global_state.batch_size:-global_state.batch_size]
+        in_channels, out_channels, *_ = conv2d.weight.shape
+        kernel_size = int(math.sqrt(global_state.dispersion_transform.shape[0]))
+        transformed_weight = torch.einsum(
+            "mn, ion -> iom",
+            global_state.dispersion_transform.to(device=conv2d.weight.device, dtype=conv2d.weight.dtype),
+            conv2d.weight.view(in_channels, out_channels, -1)
+        )
 
-    if (
-        block_type in {"down", "up"} and block_index < global_state.inner_blocks or
-        block_type == "middle"
-    ):
-        x = dilate_conv2d_undilate(self, x, global_state.dilation, out_shape, original_function, *args, **kwargs)
-    else:
-        x = original_function(x, *args, **kwargs)
+        self.conv2d = torch.nn.Conv2d(
+            out_channels, in_channels, (kernel_size, kernel_size),
+            stride=conv2d.stride, padding=conv2d.padding,
+            device=conv2d.weight.device, dtype=conv2d.weight.dtype,
+        )
+        self.conv2d.weight.data.copy_(transformed_weight.view(in_channels, out_channels, kernel_size, kernel_size))
+        self.conv2d.bias.data.copy_(conv2d.bias.data)
 
-    if (
-        global_state.enable_damped_cfg and
-        block_type in {"down", "up"} and global_state.damped_blocks_start <= block_index < global_state.damped_blocks_stop
-    ):
-        x_damped_uncond = dilate_conv2d_undilate(self, x_damped_uncond, global_state.dilation, out_shape, original_function, *args, **kwargs)
-    else:
-        x_damped_uncond = original_function(x_damped_uncond, *args, **kwargs)
-
-    return torch.cat([x_damped_uncond, x, x_uncond])
-
-
-def dilate_conv2d_undilate(self, x, dilation, out_shape, original_function, *args, **kwargs):
-    dilation_ceil = math.ceil(dilation)
-    x_scale_factor = dilation_ceil / dilation
-    x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
-
-    original_dilation = self.dilation
-    original_padding = self.padding
-    try:
-        self.dilation = (dilation_ceil, dilation_ceil)
-        self.padding = (dilation_ceil, dilation_ceil)
-        x = original_function(x, *args, **kwargs)
-    finally:
-        self.dilation = original_dilation
-        self.padding = original_padding
-
-    return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
+    def forward(self, x, dilation: int, *args, **kwargs):
+        self.conv2d.stride = (dilation, dilation)
+        self.conv2d.padding = (dilation, dilation)
+        return self.conv2d(x, *args, **kwargs)
