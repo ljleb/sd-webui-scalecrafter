@@ -255,28 +255,21 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
             in_channels=conv2d.in_channels,
             out_channels=conv2d.out_channels,
             kernel_size=conv2d.kernel_size,
-            stride=conv2d.stride,
-            padding=conv2d.padding,
-            dilation=conv2d.dilation,
-            groups=conv2d.groups,
-            padding_mode=conv2d.padding_mode,
-            device=conv2d.weight.device,
-            dtype=conv2d.weight.dtype,
+            device="meta",
         )
-        self.weight.data.copy_(conv2d.weight.data)
-        self.bias.data.copy_(conv2d.bias.data)
-        self.dispersed_conv2d = DispersedConv2D(conv2d)
+        self.conv2d = conv2d
         self.block_type = block_type
         self.block_index = block_index
+        self.__initialized = True
 
     def forward(self, x, *args, **kwargs):
         if not (
             global_state.enable and
             global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
         ):
-            return super().forward(x, *args, **kwargs)
+            return self.conv2d(x, *args, **kwargs)
 
-        x_uncond = super().forward(x[-global_state.batch_size:], *args, **kwargs)
+        x_uncond = self.conv2d(x[-global_state.batch_size:], *args, **kwargs)
         out_shape = x_uncond.shape[-2:]
         x_damped_uncond = x[:global_state.batch_size]
         x = x[global_state.batch_size:-global_state.batch_size]
@@ -287,7 +280,7 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         ):
             x = self.redilate_forward(x, out_shape, *args, **kwargs)
         else:
-            x = super().forward(x, *args, **kwargs)
+            x = self.conv2d(x, *args, **kwargs)
 
         if (
             global_state.enable_damped_cfg and
@@ -295,7 +288,7 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         ):
             x_damped_uncond = self.redilate_forward(x_damped_uncond, out_shape, *args, **kwargs)
         else:
-            x_damped_uncond = super().forward(x_damped_uncond, *args, **kwargs)
+            x_damped_uncond = self.conv2d(x_damped_uncond, *args, **kwargs)
 
         return torch.cat([x_damped_uncond, x, x_uncond])
 
@@ -303,31 +296,53 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         dilation_ceil = math.ceil(global_state.dilation)
         x_scale_factor = dilation_ceil / global_state.dilation
         x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
-        x = self.dispersed_conv2d(x, dilation_ceil, *args, **kwargs)
+        original_dilation, original_padding = self.conv2d.dilation, self.conv2d.padding
+        try:
+            conv2d = self.conv2d
+            if True:
+                conv2d = disperse_conv2d(conv2d, dilation_ceil)
+            x = conv2d(x, *args, **kwargs)
+            del conv2d
+        finally:
+            self.conv2d.dilation, self.conv2d.padding = original_dilation, original_padding
         return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
 
+    def __getattr__(self, item):
+        try:
+            if not self.__dict__.get("__initialized", False):
+                return super().__getattr__(item)
 
-class DispersedConv2D(torch.nn.Module):
-    def __init__(self, conv2d):
-        super().__init__()
+            if item == "forward":
+                return self.__dict__[item]
+            elif hasattr(self.__dict__["conv2d"], item):
+                return getattr(self.__dict__["conv2d"], item)
+            else:
+                return super().__getattr__(item)
+        except KeyError as e:
+            raise AttributeError from e
 
-        in_channels, out_channels, *_ = conv2d.weight.shape
-        kernel_size = int(math.sqrt(global_state.dispersion_transform.shape[0]))
-        transformed_weight = torch.einsum(
-            "mn, ion -> iom",
-            global_state.dispersion_transform.to(device=conv2d.weight.device, dtype=conv2d.weight.dtype),
-            conv2d.weight.view(in_channels, out_channels, -1)
-        )
 
-        self.conv2d = torch.nn.Conv2d(
-            out_channels, in_channels, (kernel_size, kernel_size),
-            stride=conv2d.stride, padding=conv2d.padding,
-            device=conv2d.weight.device, dtype=conv2d.weight.dtype,
-        )
-        self.conv2d.weight.data.copy_(transformed_weight.view(in_channels, out_channels, kernel_size, kernel_size))
-        self.conv2d.bias.data.copy_(conv2d.bias.data)
+def disperse_conv2d(conv2d: torch.nn.Conv2d, dilation: int):
+    in_channels, out_channels, *_ = conv2d.weight.shape
+    kernel_size = int(math.sqrt(global_state.dispersion_transform.shape[0]))
+    transformed_weight = torch.einsum(
+        "mn, ion -> iom",
+        global_state.dispersion_transform.to(device=conv2d.weight.device, dtype=conv2d.weight.dtype),
+        conv2d.weight.view(in_channels, out_channels, -1)
+    )
 
-    def forward(self, x, dilation: int, *args, **kwargs):
-        self.conv2d.stride = (dilation, dilation)
-        self.conv2d.padding = (dilation, dilation)
-        return self.conv2d(x, *args, **kwargs)
+    dispersed_conv2d = torch.nn.Conv2d(
+        in_channels=out_channels,
+        out_channels=in_channels,
+        kernel_size=(kernel_size, kernel_size),
+        stride=conv2d.stride,
+        padding=(dilation, dilation),
+        dilation=(dilation, dilation),
+        groups=conv2d.groups,
+        padding_mode=conv2d.padding_mode,
+        device=conv2d.weight.device,
+        dtype=conv2d.weight.dtype,
+    )
+    dispersed_conv2d.weight.data.copy_(transformed_weight.view(in_channels, out_channels, kernel_size, kernel_size))
+    dispersed_conv2d.bias.data.copy_(conv2d.bias.data)
+    return dispersed_conv2d
