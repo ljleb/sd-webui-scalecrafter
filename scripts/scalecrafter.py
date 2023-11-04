@@ -249,6 +249,7 @@ def patch_conv2d(unet, block_type, block_index):
         except ValueError:
             setattr(current_module, keys[-1], conv)
 
+
 class ScheduledRedilatedConv2D(torch.nn.Conv2d):
     def __init__(self, conv2d, block_type, block_index):
         super().__init__(
