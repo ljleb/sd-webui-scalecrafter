@@ -41,9 +41,28 @@ class Script(scripts.Script):
                 elem_id=self.elem_id("inner_blocks"),
             )
 
-        return enable, stop_step_ratio, inner_blocks
+            with gr.Row():
+                damped_inner_blocks = gr.Slider(
+                    label="Noise-Damped CFG Inner Blocks",
+                    value=7,
+                    minimum=0,
+                    maximum=12,
+                    step=1,
+                    elem_id=self.elem_id("noise_damped_inner_blocks"),
+                )
 
-    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, *args, **kwargs):
+                damped_outer_blocks = gr.Slider(
+                    label="Noise-Damped CFG Outer Blocks",
+                    value=12,
+                    minimum=0,
+                    maximum=12,
+                    step=1,
+                    elem_id=self.elem_id("noise_damped_outer_blocks"),
+                )
+
+        return enable, stop_step_ratio, inner_blocks, damped_inner_blocks, damped_outer_blocks
+
+    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, damped_inner_blocks, damped_outer_blocks, *args, **kwargs):
         global_state.enable = enable
 
         train_size = 1024 if p.sd_model.is_sdxl else 512
@@ -51,6 +70,8 @@ class Script(scripts.Script):
         global_state.dilation_x = p.width / train_size
         global_state.dilation_y = p.height / train_size
         global_state.inner_blocks = inner_blocks
+        global_state.damped_inner_blocks = damped_inner_blocks
+        global_state.damped_outer_blocks = damped_outer_blocks
         global_state.stop_step_ratio = stop_step_ratio
 
     def before_process_batch(self, p, *args, **kwargs):
@@ -189,6 +210,11 @@ script_callbacks.on_model_loaded(make_dilate_model)
 def patch_conv2d(module, block_type, block_index):
     for name, submodule in module.named_modules():
         if isinstance(submodule, torch.nn.Conv2d) and (submodule.kernel_size == 3 or submodule.kernel_size == (3, 3)):
+            if getattr(submodule, "__scalecrafter_hijacked", False):
+                continue
+            else:
+                setattr(submodule, "__scalecrafter_hijacked", True)
+
             submodule.forward = functools.partial(
                 conv2d_forward_patch,
                 block_type=block_type,
@@ -201,19 +227,36 @@ def patch_conv2d(module, block_type, block_index):
 def conv2d_forward_patch(x, *args, block_type, block_index, self, original_function, **kwargs):
     if not (
         global_state.enable and
-        global_state.current_step / global_state.total_steps < global_state.stop_step_ratio and (
-            block_type in {"down", "up"} and block_index < global_state.inner_blocks or
-            block_type == "middle"
-        )
+        global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
     ):
         return original_function(x, *args, **kwargs)
 
     x_uncond = original_function(x[-global_state.batch_size:], *args, **kwargs)
-    x = x[:-global_state.batch_size]
+    out_shape = x_uncond.shape[-2:]
+    x_damped_uncond = x[:global_state.batch_size]
+    x = x[global_state.batch_size:-global_state.batch_size]
 
-    dilation_ceil = math.ceil(global_state.dilation)
+    if (
+        block_type in {"down", "up"} and block_index < global_state.inner_blocks or
+        block_type == "middle"
+    ):
+        x = dilate_conv2d_undilate(self, x, global_state.dilation, out_shape, original_function, *args, **kwargs)
+    else:
+        x = original_function(x, *args, **kwargs)
 
-    x_scale_factor = dilation_ceil / global_state.dilation
+    if (
+        block_type in {"down", "up"} and global_state.damped_outer_blocks <= block_index < global_state.damped_inner_blocks
+    ):
+        x_damped_uncond = dilate_conv2d_undilate(self, x_damped_uncond, global_state.dilation, out_shape, original_function, *args, **kwargs)
+    else:
+        x_damped_uncond = original_function(x_damped_uncond, *args, **kwargs)
+
+    return torch.cat([x_damped_uncond, x, x_uncond])
+
+
+def dilate_conv2d_undilate(self, x, dilation, out_shape, original_function, *args, **kwargs):
+    dilation_ceil = math.ceil(dilation)
+    x_scale_factor = dilation_ceil / dilation
     x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
 
     original_dilation = self.dilation
@@ -226,5 +269,4 @@ def conv2d_forward_patch(x, *args, block_type, block_index, self, original_funct
         self.dilation = original_dilation
         self.padding = original_padding
 
-    x = torch.nn.functional.interpolate(x, size=x_uncond.shape[-2:], mode="bilinear")
-    return torch.cat([x, x_uncond])
+    return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
