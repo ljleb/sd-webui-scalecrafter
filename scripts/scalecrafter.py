@@ -42,10 +42,15 @@ class Script(scripts.Script):
             )
 
             with gr.Accordion(label="Noise-Damped CFG Scale"):
+                enable_damped_cfg = gr.Checkbox(
+                    label="Enable Noise-Damped CFG Scale",
+                    value=True,
+
+                )
                 with gr.Row():
                     damped_blocks_start = gr.Slider(
                         label="First Block (Included)",
-                        value=7,
+                        value=0,
                         minimum=0,
                         maximum=12,
                         step=1,
@@ -54,7 +59,7 @@ class Script(scripts.Script):
 
                     damped_blocks_stop = gr.Slider(
                         label="Last Block (Excluded)",
-                        value=12,
+                        value=5,
                         minimum=7,
                         maximum=12,
                         step=1,
