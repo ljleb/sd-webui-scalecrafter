@@ -1,15 +1,19 @@
 import functools
+import gradio as gr
 import math
 import sys
 import textwrap
-from typing import List, Tuple
 import torch.nn
-import gradio as gr
-from modules import scripts, processing, script_callbacks, prompt_parser, sd_samplers
 from lib_scalecrafter import global_state, hijacker
+from modules import processing, prompt_parser, scripts, script_callbacks, sd_samplers, ui_common, ui_components, shared
+from typing import List, Tuple
 
 
 class Script(scripts.Script):
+    def __init__(self):
+        self.width_component = None
+        self.height_component = None
+
     def title(self):
         return "ScaleCrafter"
 
@@ -17,53 +21,98 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with gr.Accordion(label=self.title(), open=False):
-            enable = gr.Checkbox(
-                label="Enabled",
-                value=False,
-                elem_id=self.elem_id("enable"),
-            )
+        global_state.discover_dispersion_transforms()
 
-            stop_step_ratio = gr.Slider(
-                label="Stop At Step",
-                value=0.5,
-                minimum=0,
-                maximum=1,
-                elem_id=self.elem_id("stop_at_step"),
-            )
+        with ui_components.InputAccordion(label=self.title(), open=False, value=True) as accordion:  # value not used
+            with accordion.extra():
+                effective_dilation = ui_components.FormHTML(value="", elem_id=self.elem_id("effective_dilation"), label="Effective Dilation", interactive=False, min_width=0)
 
-            inner_blocks = gr.Slider(
-                label="Inner Blocks",
-                value=5,
-                minimum=0,
-                maximum=12,
-                step=1,
-                elem_id=self.elem_id("inner_blocks"),
-            )
+            with gr.Row():
+                with gr.Column(min_width=0):
+                    enable = gr.Checkbox(
+                        label="Enabled",
+                        value=False,
+                        elem_id=self.elem_id("enable"),
+                    )
 
-            with gr.Accordion(label="Noise-Damped CFG Scale"):
+                with gr.Column(scale=2):
+                    stop_step_ratio = gr.Slider(
+                        label="Stop At Step",
+                        value=0.5,
+                        minimum=0,
+                        maximum=1,
+                        elem_id=self.elem_id("stop_at_step"),
+                    )
+
+            with gr.Row():
+                dilation_adjustment_ratio = gr.Slider(
+                    label="Dilation Adjustment Ratio",
+                    value=1,
+                    minimum=0.01,
+                    maximum=2,
+                    elem_id=self.elem_id("dilation_adjustment_ratio")
+                )
+
+                with gr.Column(scale=2):
+                    inner_blocks = gr.Slider(
+                        label="Inner Blocks",
+                        value=3,
+                        minimum=0,
+                        maximum=12,
+                        step=1,
+                        elem_id=self.elem_id("inner_blocks"),
+                    )
+
+            with gr.Accordion(label="Noise-Damped CFG Scale", open=True):
                 enable_damped_cfg = gr.Checkbox(
                     label="Enable Noise-Damped CFG Scale",
                     value=True,
                     elem_id=self.elem_id("noise_damped_enable")
                 )
+
                 with gr.Row():
                     damped_blocks_start = gr.Slider(
                         label="First Block (Included)",
                         value=0,
                         minimum=0,
-                        maximum=5,
+                        maximum=3,
                         step=1,
                         elem_id=self.elem_id("noise_damped_block_start"),
                     )
 
                     damped_blocks_stop = gr.Slider(
                         label="Last Block (Excluded)",
-                        value=5,
+                        value=3,
                         minimum=0,
                         maximum=12,
                         step=1,
                         elem_id=self.elem_id("noise_damped_block_stop"),
+                    )
+
+            with gr.Accordion(label="Dispersed Convolution", open=True):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        dispersion_inner_blocks = gr.Slider(
+                            label="Dispersion Inner Blocks",
+                            value=3,
+                            minimum=0,
+                            maximum=12,
+                            step=1,
+                            elem_id=self.elem_id("dispersion_inner_blocks"),
+                        )
+
+                    dispersion_transform = gr.Dropdown(
+                        label="Transform Matrix",
+                        value=next(iter(global_state.dispersion_transforms.keys())),
+                        choices=list(global_state.dispersion_transforms.keys()),
+                        elem_id=self.elem_id("dispersion_transforms")
+                    )
+
+                    ui_common.create_refresh_button(
+                        refresh_component=dispersion_transform,
+                        refresh_method=global_state.discover_dispersion_transforms,
+                        refreshed_args=lambda: {"choices": list(global_state.dispersion_transforms.keys())},
+                        elem_id="refresh_dispersion_transforms",
                     )
 
         damped_blocks_start.release(
@@ -78,33 +127,98 @@ class Script(scripts.Script):
             outputs=[damped_blocks_start],
         )
 
-        return enable, stop_step_ratio, inner_blocks, enable_damped_cfg, damped_blocks_start, damped_blocks_stop
+        def effective_dilation_html(enable, width, height, dilation_rescale):
+            if not enable:
+                return ""
 
-    def process(self, p: processing.StableDiffusionProcessing, enable, stop_step_ratio, inner_blocks, enable_damped_cfg, damped_blocks_start, damped_blocks_stop, *args, **kwargs):
+            effective_dilation = calc_dilation(width, height, dilation_rescale)
+            return f"effective dilation <span class='convolution-dilation'>{effective_dilation:.2f}</span>"
+
+        for component in (enable, dilation_adjustment_ratio, self.width_component, self.height_component):
+            event = getattr(component, "release", component.change)
+            event(
+                fn=effective_dilation_html,
+                inputs=[enable, self.width_component, self.height_component, dilation_adjustment_ratio],
+                outputs=[effective_dilation],
+            )
+
+        return (
+            enable,
+            stop_step_ratio,
+            inner_blocks,
+            enable_damped_cfg,
+            damped_blocks_start,
+            damped_blocks_stop,
+            dilation_adjustment_ratio,
+            dispersion_transform,
+            dispersion_inner_blocks,
+        )
+
+    def after_component(self, component, **kwargs):
+        if self.is_txt2img:
+            tab = "txt2img"
+        else:
+            tab = "img2img"
+
+        if getattr(component, "elem_id", None) == f"{tab}_width":
+            self.width_component = component
+        elif getattr(component, "elem_id", None) == f"{tab}_height":
+            self.height_component = component
+
+    def process(
+        self,
+        p: processing.StableDiffusionProcessing,
+        enable,
+        stop_step_ratio,
+        inner_blocks,
+        enable_damped_cfg,
+        damped_blocks_start,
+        damped_blocks_stop,
+        dilation_adjustment_ratio,
+        dispersion_transform,
+        dispersion_inner_blocks,
+        *args, **kwargs
+    ):
         global_state.enable = enable
+        global_state.stop_step_ratio = stop_step_ratio
 
-        train_size = 1024 if p.sd_model.is_sdxl else 512
-        global_state.dilation = math.sqrt(p.width * p.height) / train_size
-        global_state.dilation_x = p.width / train_size
-        global_state.dilation_y = p.height / train_size
+        global_state.dilation = calc_dilation(p.width, p.height, dilation_adjustment_ratio)
         global_state.inner_blocks = inner_blocks
+
         global_state.enable_damped_cfg = enable_damped_cfg
         global_state.damped_blocks_start = damped_blocks_start
         global_state.damped_blocks_stop = damped_blocks_stop
-        global_state.stop_step_ratio = stop_step_ratio
+
+        global_state.current_dispersion_transform = global_state.dispersion_transforms.get(dispersion_transform, None)
+        global_state.dispersion_inner_blocks = dispersion_inner_blocks
 
     def before_process_batch(self, p, *args, **kwargs):
         global_state.current_step = 0
         global_state.total_steps = p.steps
         global_state.batch_size = p.batch_size
 
-    def before_hr(self, p: processing.StableDiffusionProcessingTxt2Img, *args):
+    def before_hr(
+        self,
+        p: processing.StableDiffusionProcessingTxt2Img,
+        enable,
+        stop_step_ratio,
+        inner_blocks,
+        enable_damped_cfg,
+        damped_blocks_start,
+        damped_blocks_stop,
+        dilation_adjustment_ratio,
+        dispersion_transform,
+        dispersion_inner_blocks,
+        *args, **kwargs
+    ):
         global_state.total_steps = p.steps
+        global_state.current_step = 0
+        global_state.dilation = calc_dilation(p.hr_upscale_to_x, p.hr_upscale_to_y, dilation_adjustment_ratio)
 
-        train_size = 1024 if p.sd_model.is_sdxl else 512
-        global_state.dilation = math.sqrt(p.width * p.height) / train_size
-        global_state.dilation_x = p.width / train_size
-        global_state.dilation_y = p.height / train_size
+
+def calc_dilation(width, height, dilation_rescale):
+    train_size = 1024 if shared.sd_model.is_sdxl else 512
+    return math.sqrt(width * height) / train_size * dilation_rescale
 
 
 prompt_parser_hijacker = hijacker.ModuleHijacker.install_or_get(
@@ -120,7 +234,7 @@ def get_multicond_learned_conditioning_hijack(model, prompts, steps, *args, orig
     if not global_state.enable:
         return conds
 
-    empty_schedule = prompt_parser.get_learned_conditioning(model, [""], steps, *args, **kwargs)[0]
+    empty_schedule = prompt_parser.get_learned_conditioning(model, prompt_parser.SdConditioning([""]), steps, *args, **kwargs)[0]
     conds.batch[0][:0] = [prompt_parser.ComposableScheduledPromptConditioning(schedules=empty_schedule)] * len(conds.batch)
     return conds
 
@@ -196,13 +310,6 @@ def warn_unsupported_sampler():
     ''')
 
 
-def warn_projection_not_found():
-    console_warn('''
-        Could not find a projection for one or more AND_PERP prompts
-        These prompts will NOT be made perpendicular
-    ''')
-
-
 def console_warn(message):
     if not global_state.verbose:
         return
@@ -211,6 +318,10 @@ def console_warn(message):
 
 
 def make_dilate_model(model):
+    if getattr(model, "__scalecrafter_hijacked", False):
+        return
+
+    setattr(model, "__scalecrafter_hijacked", True)
     unet = model.model.diffusion_model
 
     for in_block_i, in_block in enumerate(reversed(unet.input_blocks)):
@@ -226,67 +337,90 @@ def make_dilate_model(model):
 script_callbacks.on_model_loaded(make_dilate_model)
 
 
-def patch_conv2d(module, block_type, block_index):
-    for name, submodule in module.named_modules():
+def patch_conv2d(unet, block_type, block_index):
+    for name, submodule in list(unet.named_modules()):
         if isinstance(submodule, torch.nn.Conv2d) and (submodule.kernel_size == 3 or submodule.kernel_size == (3, 3)):
-            if getattr(submodule, "__scalecrafter_hijacked", False):
-                continue
-            else:
-                setattr(submodule, "__scalecrafter_hijacked", True)
-
-            submodule.forward = functools.partial(
-                conv2d_forward_patch,
-                block_type=block_type,
-                block_index=block_index,
-                self=submodule,
-                original_function=submodule.forward,
-            )
+            submodule.forward = ScheduledRedilatedConv2dForward(submodule, block_type, block_index, submodule.forward)
 
 
-def conv2d_forward_patch(x, *args, block_type, block_index, self, original_function, **kwargs):
-    if not (
-        global_state.enable and
-        global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
-    ):
-        return original_function(x, *args, **kwargs)
+class ScheduledRedilatedConv2dForward:
+    def __init__(self, conv2d, block_type, block_index, original_forward):
+        self.conv2d = conv2d
+        self.block_type = block_type
+        self.block_index = block_index
+        self.original_forward = original_forward
 
-    x_uncond = original_function(x[-global_state.batch_size:], *args, **kwargs)
-    out_shape = x_uncond.shape[-2:]
-    x_damped_uncond = x[:global_state.batch_size]
-    x = x[global_state.batch_size:-global_state.batch_size]
+    def __call__(self, x, *args, **kwargs):
+        if not (
+            global_state.enable and
+            global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
+        ):
+            return self.original_forward(x, *args, **kwargs)
 
-    if (
-        block_type in {"down", "up"} and block_index < global_state.inner_blocks or
-        block_type == "middle"
-    ):
-        x = dilate_conv2d_undilate(self, x, global_state.dilation, out_shape, original_function, *args, **kwargs)
-    else:
-        x = original_function(x, *args, **kwargs)
+        x_uncond = self.original_forward(x[-global_state.batch_size:], *args, **kwargs)
+        out_shape = x_uncond.shape[-2:]
+        x_damped_uncond = x[:global_state.batch_size]
+        x = x[global_state.batch_size:-global_state.batch_size]
 
-    if (
-        global_state.enable_damped_cfg and
-        block_type in {"down", "up"} and global_state.damped_blocks_start <= block_index < global_state.damped_blocks_stop
-    ):
-        x_damped_uncond = dilate_conv2d_undilate(self, x_damped_uncond, global_state.dilation, out_shape, original_function, *args, **kwargs)
-    else:
-        x_damped_uncond = original_function(x_damped_uncond, *args, **kwargs)
+        if (
+            self.block_type in {"down", "up"} and self.block_index < global_state.inner_blocks or
+            self.block_type == "middle"
+        ):
+            x = self.redilate_forward(x, out_shape, *args, **kwargs)
+        else:
+            x = self.original_forward(x, *args, **kwargs)
 
-    return torch.cat([x_damped_uncond, x, x_uncond])
+        if (
+            global_state.enable_damped_cfg and
+            self.block_type in {"down", "up"} and global_state.damped_blocks_start <= self.block_index < global_state.damped_blocks_stop
+        ):
+            x_damped_uncond = self.redilate_forward(x_damped_uncond, out_shape, *args, **kwargs)
+        else:
+            x_damped_uncond = self.original_forward(x_damped_uncond, *args, **kwargs)
+
+        return torch.cat([x_damped_uncond, x, x_uncond])
+
+    def redilate_forward(self, x, out_shape, *args, **kwargs):
+        dilation_ceil = math.ceil(global_state.dilation)
+        x_scale_factor = dilation_ceil / global_state.dilation
+        x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
+        original_dilation, original_padding = self.conv2d.dilation, self.conv2d.padding
+        try:
+            self.conv2d.dilation, self.conv2d.padding = ((dilation_ceil,)*2,)*2
+            conv2d = self.original_forward
+            if (
+                global_state.current_dispersion_transform is not None and
+                self.block_index < global_state.dispersion_inner_blocks
+            ):
+                conv2d = disperse_conv2d(self.conv2d, dilation_ceil)
+            x = conv2d(x, *args, **kwargs)
+        finally:
+            self.conv2d.dilation, self.conv2d.padding = original_dilation, original_padding
+        return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
 
 
-def dilate_conv2d_undilate(self, x, dilation, out_shape, original_function, *args, **kwargs):
-    dilation_ceil = math.ceil(dilation)
-    x_scale_factor = dilation_ceil / dilation
-    x = torch.nn.functional.interpolate(x, scale_factor=x_scale_factor, mode="bilinear")
+def disperse_conv2d(conv2d: torch.nn.Conv2d, dilation: int):
+    in_channels, out_channels, *_ = conv2d.weight.shape
+    dispersion_transform = global_state.current_dispersion_transform.load_model(device=conv2d.weight.device, dtype=conv2d.weight.dtype)
+    kernel_size = int(math.sqrt(dispersion_transform.shape[0]))
+    transformed_weight = torch.einsum(
+        "mn, ion -> iom",
+        dispersion_transform,
+        conv2d.weight.view(in_channels, out_channels, -1)
+    ).view(in_channels, out_channels, kernel_size, kernel_size)
 
-    original_dilation = self.dilation
-    original_padding = self.padding
-    try:
-        self.dilation = (dilation_ceil, dilation_ceil)
-        self.padding = (dilation_ceil, dilation_ceil)
-        x = original_function(x, *args, **kwargs)
-    finally:
-        self.dilation = original_dilation
-        self.padding = original_padding
-
-    return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
+    dispersed_conv2d = torch.nn.Conv2d(
+        in_channels=out_channels,
+        out_channels=in_channels,
+        kernel_size=(kernel_size, kernel_size),
+        stride=conv2d.stride,
+        padding=(dilation, dilation),
+        dilation=(dilation, dilation),
+        groups=conv2d.groups,
+        padding_mode=conv2d.padding_mode,
+        device=conv2d.weight.device,
+        dtype=conv2d.weight.dtype,
+    )
+    dispersed_conv2d.weight.data.copy_(transformed_weight)
+    dispersed_conv2d.bias.data.copy_(conv2d.bias.data)
+    return dispersed_conv2d
