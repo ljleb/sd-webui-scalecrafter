@@ -56,7 +56,7 @@ class Script(scripts.Script):
                 with gr.Column(scale=2):
                     inner_blocks = gr.Slider(
                         label="Inner Blocks",
-                        value=5,
+                        value=3,
                         minimum=0,
                         maximum=12,
                         step=1,
@@ -75,14 +75,14 @@ class Script(scripts.Script):
                         label="First Block (Included)",
                         value=0,
                         minimum=0,
-                        maximum=5,
+                        maximum=3,
                         step=1,
                         elem_id=self.elem_id("noise_damped_block_start"),
                     )
 
                     damped_blocks_stop = gr.Slider(
                         label="Last Block (Excluded)",
-                        value=5,
+                        value=3,
                         minimum=0,
                         maximum=12,
                         step=1,
@@ -94,7 +94,7 @@ class Script(scripts.Script):
                     with gr.Column(scale=2):
                         dispersion_inner_blocks = gr.Slider(
                             label="Dispersion Inner Blocks",
-                            value=5,
+                            value=3,
                             minimum=0,
                             maximum=12,
                             step=1,
@@ -234,7 +234,7 @@ def get_multicond_learned_conditioning_hijack(model, prompts, steps, *args, orig
     if not global_state.enable:
         return conds
 
-    empty_schedule = prompt_parser.get_learned_conditioning(model, [""], steps, *args, **kwargs)[0]
+    empty_schedule = prompt_parser.get_learned_conditioning(model, prompt_parser.SdConditioning([""]), steps, *args, **kwargs)[0]
     conds.batch[0][:0] = [prompt_parser.ComposableScheduledPromptConditioning(schedules=empty_schedule)] * len(conds.batch)
     return conds
 
@@ -310,13 +310,6 @@ def warn_unsupported_sampler():
     ''')
 
 
-def warn_projection_not_found():
-    console_warn('''
-        Could not find a projection for one or more AND_PERP prompts
-        These prompts will NOT be made perpendicular
-    ''')
-
-
 def console_warn(message):
     if not global_state.verbose:
         return
@@ -325,6 +318,10 @@ def console_warn(message):
 
 
 def make_dilate_model(model):
+    if getattr(model, "__scalecrafter_hijacked", False):
+        return
+
+    setattr(model, "__scalecrafter_hijacked", True)
     unet = model.model.diffusion_model
 
     for in_block_i, in_block in enumerate(reversed(unet.input_blocks)):
@@ -341,53 +338,26 @@ script_callbacks.on_model_loaded(make_dilate_model)
 
 
 def patch_conv2d(unet, block_type, block_index):
-    updates = {}
     for name, submodule in list(unet.named_modules()):
         if isinstance(submodule, torch.nn.Conv2d) and (submodule.kernel_size == 3 or submodule.kernel_size == (3, 3)):
-            updates[name] = ScheduledRedilatedConv2D(submodule, block_type, block_index)
-
-    for name, conv in updates.items():
-        current_module = unet
-        keys = name.split(".")
-        for key in keys[:-1]:
-            try:
-                current_module = current_module[int(key)]
-            except ValueError:
-                current_module = getattr(current_module, key)
-        try:
-            current_module[int(keys[-1])] = conv
-        except ValueError:
-            setattr(current_module, keys[-1], conv)
+            submodule.forward = ScheduledRedilatedConv2dForward(submodule, block_type, block_index, submodule.forward)
 
 
-class ScheduledRedilatedConv2D(torch.nn.Conv2d):
-    def __init__(self, conv2d, block_type, block_index):
-        super().__init__(
-            in_channels=conv2d.in_channels,
-            out_channels=conv2d.out_channels,
-            kernel_size=conv2d.kernel_size,
-            stride=conv2d.stride,
-            padding=conv2d.padding,
-            dilation=conv2d.dilation,
-            groups=conv2d.groups,
-            device=conv2d.weight.data.device,
-            dtype=conv2d.weight.data.dtype,
-        )
-        self.weight = conv2d.weight
-        self.bias = conv2d.bias
+class ScheduledRedilatedConv2dForward:
+    def __init__(self, conv2d, block_type, block_index, original_forward):
         self.conv2d = conv2d
         self.block_type = block_type
         self.block_index = block_index
-        self.__initialized = True
+        self.original_forward = original_forward
 
-    def forward(self, x, *args, **kwargs):
+    def __call__(self, x, *args, **kwargs):
         if not (
             global_state.enable and
             global_state.current_step / global_state.total_steps < global_state.stop_step_ratio
         ):
-            return self.conv2d(x, *args, **kwargs)
+            return self.original_forward(x, *args, **kwargs)
 
-        x_uncond = self.conv2d(x[-global_state.batch_size:], *args, **kwargs)
+        x_uncond = self.original_forward(x[-global_state.batch_size:], *args, **kwargs)
         out_shape = x_uncond.shape[-2:]
         x_damped_uncond = x[:global_state.batch_size]
         x = x[global_state.batch_size:-global_state.batch_size]
@@ -398,7 +368,7 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         ):
             x = self.redilate_forward(x, out_shape, *args, **kwargs)
         else:
-            x = self.conv2d(x, *args, **kwargs)
+            x = self.original_forward(x, *args, **kwargs)
 
         if (
             global_state.enable_damped_cfg and
@@ -406,7 +376,7 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         ):
             x_damped_uncond = self.redilate_forward(x_damped_uncond, out_shape, *args, **kwargs)
         else:
-            x_damped_uncond = self.conv2d(x_damped_uncond, *args, **kwargs)
+            x_damped_uncond = self.original_forward(x_damped_uncond, *args, **kwargs)
 
         return torch.cat([x_damped_uncond, x, x_uncond])
 
@@ -417,31 +387,16 @@ class ScheduledRedilatedConv2D(torch.nn.Conv2d):
         original_dilation, original_padding = self.conv2d.dilation, self.conv2d.padding
         try:
             self.conv2d.dilation, self.conv2d.padding = ((dilation_ceil,)*2,)*2
-            conv2d = self.conv2d
+            conv2d = self.original_forward
             if (
                 global_state.current_dispersion_transform is not None and
                 self.block_index < global_state.dispersion_inner_blocks
             ):
-                conv2d = disperse_conv2d(conv2d, dilation_ceil)
+                conv2d = disperse_conv2d(self.conv2d, dilation_ceil)
             x = conv2d(x, *args, **kwargs)
-            del conv2d
         finally:
             self.conv2d.dilation, self.conv2d.padding = original_dilation, original_padding
         return torch.nn.functional.interpolate(x, size=out_shape, mode="bilinear")
-
-    def __getattr__(self, item):
-        try:
-            if not self.__dict__.get("__initialized", False):
-                return super().__getattr__(item)
-
-            if item == "forward":
-                return self.__dict__[item]
-            elif hasattr(self.__dict__["conv2d"], item):
-                return getattr(self.__dict__["conv2d"], item)
-            else:
-                return super().__getattr__(item)
-        except KeyError as e:
-            raise AttributeError from e
 
 
 def disperse_conv2d(conv2d: torch.nn.Conv2d, dilation: int):
